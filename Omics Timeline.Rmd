@@ -1,0 +1,673 @@
+---
+title: "Omics Project Timeline"
+output: html_notebook
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(error = TRUE)
+#install.packages("lazyeval")
+```
+
+```{r}
+# Core single-cell / spatial analysis
+#install.packages("Seurat")        # Includes SeuratObject
+#install.packages("dplyr")
+#install.packages("ggplot2")
+#install.packages("data.table")
+#install.packages("htmlwidgets")
+#install.packages("tidyverse")
+#install.packages("gridExtra")
+
+# CRAWDAD for colocalization / spatial analysis
+#install.packages("remotes")
+#remotes::install_github("JEFworks-Lab/CRAWDAD", force = TRUE)
+
+
+#FOR THE LOVE OF GOD PLEASE WORK
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(crawdad)
+library(tidyverse)
+library(gridExtra)
+library(lazyeval)
+options(future.globals.maxSize = 6 * 1024^3)  # 6 GB, increase if needed
+```
+
+
+```{r}
+library(SeuratDisk)
+
+# Loading the Xenium assay in
+seuratHealthy  <- LoadXenium("C:/Users/silve/Documents/Spatial Omics/Healthy", segmentation = "cell")
+seuratDiseased <- LoadXenium("C:/Users/silve/Documents/Spatial Omics/Diseased", segmentation = "cell")
+
+# Manually adding RNA assay in
+x_rawHealthy <- ReadXenium("C:/Users/silve/Documents/Spatial Omics/Healthy")
+x_rawDiseased <- ReadXenium("C:/Users/silve/Documents/Spatial Omics/Diseased")
+
+
+gexp_healthy  <- x_rawHealthy$matrix[['Gene Expression']]
+gexp_diseased <- x_rawDiseased$matrix[['Gene Expression']]
+
+common_cellsHealthy <- intersect(colnames(gexp_healthy), colnames(seuratHealthy))
+gexp_healthy <- gexp_healthy[, common_cellsHealthy]
+common_cellsDiseased <- intersect(colnames(gexp_diseased), colnames(seuratDiseased))
+gexp_diseased <- gexp_diseased[, common_cellsDiseased]
+
+
+seuratHealthy[["RNA"]]  <- CreateAssayObject(counts = gexp_healthy)
+seuratDiseased[["RNA"]] <- CreateAssayObject(counts = gexp_diseased)
+
+```
+
+``` {r}
+# Number of genes per cell
+hist(seuratHealthy$nFeature_Xenium, breaks = 100, main="nFeature_Xenium", xlab="Genes per cell")
+
+# Total counts per cell
+hist(seuratHealthy$nCount_Xenium, breaks = 100, main="nCount_Xenium", xlab="Total counts per cell")
+
+```
+
+``` {r}
+# Number of genes per cell
+hist(seuratDiseased$nFeature_Xenium, breaks = 100, main="nFeature_Xenium", xlab="Genes per cell")
+
+# Total counts per cell
+hist(seuratDiseased$nCount_Xenium, breaks = 100, main="nCount_Xenium", xlab="Total counts per cell")
+
+```
+
+``` {r}
+
+# filtering
+seuratHealthy <- subset(seuratHealthy, subset = nFeature_Xenium > 10 & nFeature_Xenium < 70 & nCount_Xenium > 20 & nCount_Xenium < 300)
+seuratDiseased <- subset(seuratDiseased, subset = nFeature_Xenium > 10 & nFeature_Xenium < 100 & nCount_Xenium > 20 & nCount_Xenium < 270)
+
+counts <- GetAssayData(
+  seuratHealthy,
+  assay = "Xenium",
+  layer = "counts"
+)
+
+keep.genes <- rowSums(counts > 0) >= 50
+
+seuratHealthy <- subset(
+  seuratHealthy,
+  features = names(keep.genes)[keep.genes]
+)
+
+counts <- GetAssayData(
+  seuratDiseased,
+  assay = "Xenium",
+  layer = "counts"
+)
+
+keep.genes <- rowSums(counts > 0) >= 50
+
+seuratDiseased <- subset(
+  seuratDiseased,
+  features = names(keep.genes)[keep.genes]
+)
+
+```
+
+``` {r}
+# effective normalization and identification of highly variant genes 
+library(future)
+
+DefaultAssay(seuratHealthy) <- "RNA"
+DefaultAssay(seuratDiseased) <- "RNA"
+
+seuratHealthy$orig.ident <- "Healthy"
+seuratDiseased$orig.ident <- "Diseased"
+
+seuratHealthy <- SCTransform(
+  seuratHealthy,
+  verbose = FALSE,
+  method = "glmGamPoi", 
+  ncells = 5000,
+  return.only.var.genes = FALSE
+)
+seuratDiseased <- SCTransform(
+  seuratDiseased,
+  verbose = FALSE,
+  method = "glmGamPoi", 
+  ncells = 5000,
+  return.only.var.genes = FALSE
+)
+
+# choosing genes that are highly variable in both datasets
+seuratHealthy$condition  <- "Healthy"
+seuratDiseased$condition <- "Diseased"
+databaseList <- list(seuratHealthy, seuratDiseased)
+integrationFeatures <- SelectIntegrationFeatures(databaseList, nfeatures = 377)
+
+DefaultAssay(seuratHealthy) <- "SCT"
+DefaultAssay(seuratDiseased) <- "SCT"
+
+future::plan("sequential")
+
+prep_list <- PrepSCTIntegration(
+  object.list = databaseList,
+  anchor.features = integrationFeatures, 
+  verbose = TRUE
+)
+
+prep_list <- lapply(
+  prep_list,
+  RunPCA,
+  features = integrationFeatures,
+  verbose = FALSE
+)
+
+ 
+
+# prep for integration
+anchors <- FindIntegrationAnchors(
+  object.list = prep_list,
+  normalization.method = "SCT",
+  anchor.features = integrationFeatures,
+  reduction = "rpca",
+  dims = 1:17
+)
+
+
+# Integrate data using the anchors
+seuratIntegrated <- IntegrateData(
+  anchorset = anchors,   # anchors object returned from FindIntegrationAnchors
+  normalization.method = "SCT",  # Use SCTransform normalization
+  verbose = TRUE
+)
+
+seuratIntegrated$condition <- ifelse(
+  grepl("_1$", colnames(seuratIntegrated)),
+  "Healthy",
+  "Diseased"
+)
+
+seuratHealthy <- RunPCA(seuratHealthy)
+seuratDiseased <- RunPCA(seuratDiseased)
+seuratHealthy <- RunUMAP(seuratHealthy, dims = 1:50)
+seuratDiseased <- RunUMAP(seuratDiseased, dims = 1:50)
+
+
+# Set the default assay to the integrated assay
+DefaultAssay(seuratIntegrated) <- "integrated"
+seuratIntegrated <- RunPCA(seuratIntegrated)
+seuratIntegrated <- RunUMAP(seuratIntegrated, dims = 1:50)
+
+# attempting to graph things
+DimPlot(
+  seuratIntegrated,
+  reduction = "pca",
+  group.by = "condition",
+  cols = c("Healthy" = "#1f78b4", "Diseased" = "#e31a1c"),
+  pt.size = 1.2
+)
+DimPlot(seuratHealthy, reduction = "umap", label = TRUE)
+
+DimPlot(seuratDiseased, reduction = "umap", label = TRUE)
+
+
+
+ElbowPlot(seuratIntegrated)
+
+```
+
+``` {r}
+
+# graphing clusters to get a better sense
+seuratIntegrated <- FindNeighbors(seuratIntegrated, dims = 1:50)
+seuratIntegrated <- FindClusters(seuratIntegrated, resolution = 0.3)
+
+# to see what clusters appear to be most healthy/most diseased/mixed
+table(seuratIntegrated$seurat_clusters, seuratIntegrated$condition)
+DimPlot(seuratIntegrated, reduction = "umap", label = TRUE)
+
+DimPlot(seuratIntegrated, 
+        reduction = "umap", 
+        group.by = "condition", 
+        cols = c("Healthy" = "#1f78b4", "Diseased" = "#e31a1c")
+        )
+```
+
+``` {r}
+markers <- FindAllMarkers(seuratIntegrated, only.pos = TRUE, min.pct = 0.10, logfc.threshold = 0.25)
+top10 <- markers %>% 
+  group_by(cluster) %>% 
+  top_n(10, avg_log2FC)
+
+celltype_annotations <- c(
+  "0"  = "Perivascular",
+  "1"  = "T cells",
+  "2"  = "Fibroblasts",
+  "3"  = "Monocytes/macrophages",
+  "4"  = "Endothelial cells",
+  "5"  = "Smooth muscle / pericytes",
+  "6"  = "Intercalated cells (A/B)",
+  "7"  = "Thick ascending limb (TAL)",
+  "8"  = "C. duct principal cells - inflammatory",
+  "9"  = "Proximal tubule (S1/S2)",
+  "10" = "Parietal epithelial cells (PECs)",
+  "11" = "Distal convoluted tubule (DCT)",
+  "12" = "B cells",
+  "13" = "NK cells",
+  "14" = "Proximal tubule S3 (metabolic)",
+  "15" = "Collecting duct/distal epithelial",
+  "16" = "Mast cells",
+  "17" = "PT-S3 metabolic"
+)
+
+ct <- celltype_annotations[seuratIntegrated$seurat_clusters]
+names(ct) <- NULL
+seuratIntegrated$celltype <- ct
+
+DimPlot(
+  seuratIntegrated,
+  reduction = "umap",
+  group.by = "celltype",
+  label = TRUE,
+  repel = TRUE
+)
+
+
+```
+```{r}
+# mapping integrated cell types back to OG healthy/diseased
+future::plan(sequential)
+
+seuratHealthy <- SeuratObject:::RenameCells.Seurat(
+  seuratHealthy,
+  new.names = paste0(colnames(seuratHealthy), "_1")
+)
+
+seuratDiseased <- SeuratObject:::RenameCells.Seurat(
+  seuratDiseased,
+  new.names = paste0(colnames(seuratDiseased), "_2")
+)
+
+
+# map clusters
+seuratHealthy$seurat_clusters <- 
+  seuratIntegrated$seurat_clusters[colnames(seuratHealthy)]
+seuratDiseased$seurat_clusters <- 
+  seuratIntegrated$seurat_clusters[colnames(seuratDiseased)]
+
+seuratHealthy$celltype <- seuratIntegrated$celltype[colnames(seuratHealthy)]
+seuratDiseased$celltype <- seuratIntegrated$celltype[colnames(seuratDiseased)]
+
+
+# try and add some violin plots
+
+```
+``` {r}
+# proportional stacked bar plot
+df <- seuratIntegrated@meta.data %>%
+  group_by(seurat_clusters, condition) %>%
+  summarise(n = n()) %>%
+  group_by(seurat_clusters) %>%
+  mutate(freq = n / sum(n))
+
+ggplot(df, aes(x = seurat_clusters, y = freq, fill = condition)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Cluster",
+    y = "Percent of cells",
+    fill = "Condition",
+    title = "Healthy vs Diseased Composition per Cluster"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 16, face = "bold")
+  )
+
+df <- seuratIntegrated@meta.data %>%
+  group_by(celltype, condition) %>%
+  summarise(n = n()) %>%
+  group_by(celltype) %>%
+  mutate(freq = n / sum(n))
+
+ggplot(df, aes(x = celltype, y = freq, fill = condition)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Cell Type",
+    y = "Percent of cells",
+    fill = "Condition",
+    title = "Healthy vs Diseased Composition per Cell Type"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 16, face = "bold")
+  )
+
+# plotting metadata columns
+# healthy plotting
+coords <- GetTissueCoordinates(seuratHealthy)
+
+df <- cbind(coords, seuratHealthy@meta.data)
+
+ggplot(df, aes(x = x, y = y, color = nFeature_Xenium)) +
+  geom_point(size = 0.5) +
+  scale_color_viridis_c() +
+  coord_fixed() +
+  theme_void()
+
+ggplot(df, aes(x = x, y = y, color = nCount_Xenium)) +
+  geom_point(size = 0.5) +
+  scale_color_viridis_c() +
+  coord_fixed() +
+  theme_void()
+
+ggplot(df, aes(x = x, y = y, color = celltype)) +
+  geom_point(size = 0.5) +
+  scale_color_discrete() +
+  coord_fixed() +
+  theme_void() + guides(color = guide_legend(override.aes = list(size = 4)))
+
+# diseased plotting
+coords <- GetTissueCoordinates(seuratDiseased)
+
+df <- cbind(coords, seuratDiseased@meta.data)
+
+ggplot(df, aes(x = x, y = y, color = nFeature_Xenium)) +
+  geom_point(size = 0.5) +
+  scale_color_viridis_c() +
+  coord_fixed() +
+  theme_void()
+
+ggplot(df, aes(x = x, y = y, color = nCount_Xenium)) +
+  geom_point(size = 0.5) +
+  scale_color_viridis_c() +
+  coord_fixed() +
+  theme_void()
+
+ggplot(df, aes(x = x, y = y, color = celltype)) +
+  geom_point(size = 0.5) +
+  scale_color_discrete() +
+  coord_fixed() +
+  theme_void() + guides(color = guide_legend(override.aes = list(size = 4)))
+
+
+```
+``` {r}
+# spatial gene expression maps
+# lets do B cell/T cell prolif stuff. and then proximal tubule vs the other two proximal tubules
+
+
+coords_h <- GetTissueCoordinates(seuratHealthy)
+coords_d <- GetTissueCoordinates(seuratDiseased)
+
+expr_d <- seuratDiseased[["Xenium"]]$counts
+expr_h <- seuratHealthy[["Xenium"]]$counts
+
+expr_h_df <- as.data.frame(t(as.matrix(expr_h)))
+expr_d_df <- as.data.frame(t(as.matrix(expr_d)))
+
+df_healthy  <- cbind(coords_h, expr_h_df)
+df_diseased <- cbind(coords_d, expr_d_df)
+
+plot_gene <- function(df, gene) {
+  ggplot(df, aes(x = x, y = y, color = !!sym(gene))) + geom_point(size = 0.4) + scale_color_viridis_c(option = "plasma") + coord_fixed() + theme_void() + ggtitle(gene)
+}
+
+
+p1 <- plot_gene(df_healthy, "TM4SF4")
+p2 <- plot_gene(df_diseased, "TM4SF4")
+
+p1 | p2
+
+p1 <- plot_gene(df_healthy, "CD247")
+p2 <- plot_gene(df_diseased, "CD247")
+
+p1 | p2
+
+p1 <- plot_gene(df_healthy, "MS4A2")
+p2 <- plot_gene(df_diseased, "MS4A2")
+
+p1 | p2
+
+p1 <- plot_gene(df_healthy, "CD79A")
+p2 <- plot_gene(df_diseased, "CD79A")
+
+p1 | p2
+
+df_healthy$condition <- "Healthy"
+df_diseased$condition <- "Diseased"
+df_all <- rbind(df_healthy, df_diseased)
+genes <- c("UMOD", "CD247", "CDH16", "KIT")
+df_long <- df_all %>%
+  pivot_longer(cols = all_of(genes),
+               names_to = "gene",
+               values_to = "expr")
+ggplot(df_long, aes(x = x, y = y, color = expr)) +
+  geom_point(size = 0.3) +
+  scale_color_viridis_c(option = "plasma", trans = "log1p") +
+  coord_fixed() +
+  theme_void() +
+  facet_grid(gene ~ condition) + guides(color = guide_legend(override.aes = list(size = 4))) + theme(
+    legend.key.size = unit(0.6, "cm"),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 11)
+  )
+
+```
+``` {r}
+
+segment_markers <- c(
+  # PT S1/S2
+  "SLC5A2", "LRP2", "CUBN", "SLC34A1",
+
+  # PT S3 metabolic
+  "GATM", "NAT8", "GLYATL1", "BBOX1",
+
+  # PT S3 injury/stress
+  "HAVCR1", "LCN2", "VIM", "KRT8", "KRT18", "SOX4", "JUN",
+
+  # DCT
+  "SLC12A3", "FXYD2",
+
+  # TAL
+  "SLC12A1", "UMOD", "KCNJ1",
+
+  # Collecting duct principal
+  "AQP2", "SCNN1G",
+
+  # Intercalated cells
+  "SLC4A1", "ATP6V1B1",
+
+  # PECs
+  "CLDN1", "PAX8", "MUC1",
+
+  # PEC‑injury
+  "FGL2", "MEST", "EHF", "CA4", "CAPN8"
+)
+
+present <- segment_markers[segment_markers %in% rownames(seuratIntegrated[["Xenium"]]$counts)]
+missing <- segment_markers[!segment_markers %in% rownames(seuratIntegrated[["Xenium"]]$counts)]
+
+present
+missing
+
+DefaultAssay(seuratIntegrated) <- "SCT"
+FeaturePlot(
+  seuratIntegrated,
+  features = present[1:3],
+  reduction = "umap",
+  ncol = 3,
+) & scale_color_viridis_c(option = "plasma", trans = scales::pseudo_log_trans(sigma = 1)) & theme(legend.position = "none")
+
+FeaturePlot(
+  seuratIntegrated,
+  features = present[4:6],
+  reduction = "umap",
+  ncol = 3,
+) & scale_color_viridis_c(option = "plasma", trans = scales::pseudo_log_trans(sigma = 1)) & theme(legend.position = "none")
+
+FeaturePlot(
+  seuratIntegrated,
+  features = present[7:9],
+  reduction = "umap",
+  ncol = 3,
+) & scale_color_viridis_c(option = "plasma", trans = scales::pseudo_log_trans(sigma = 1)) & theme(legend.position = "none")
+
+FeaturePlot(
+  seuratIntegrated,
+  features = present[10:12],
+  reduction = "umap",
+  ncol = 3,
+) & scale_color_viridis_c(option = "plasma", trans = scales::pseudo_log_trans(sigma = 1)) & theme(legend.position = "none")
+
+
+
+```
+``` {r}
+# statistical analysis
+tab <- table(seuratIntegrated$celltype, seuratIntegrated$condition)
+chi <- chisq.test(tab)
+
+global_summary <- data.frame(
+  Test = "Chi-square test of independence",
+  X2_statistic = chi$statistic,
+  df = chi$parameter,
+  p_value = chi$p.value
+)
+
+global_summary # since p<0.05, the overall distribution of cells is different, stat. significantly, between healthy vs diseased
+
+
+celltypes <- unique(seuratIntegrated$celltype)
+
+fisher_table <- lapply(celltypes, function(ct) {
+  sub <- seuratIntegrated$celltype == ct
+  tab <- table(sub, seuratIntegrated$condition)
+  ft <- fisher.test(tab)
+
+  tibble(
+    celltype = ct,
+    odds_ratio = as.numeric(ft$estimate),
+    p_value = ft$p.value
+  )
+}) %>% bind_rows()
+
+fisher_table
+# an odds ratio > 1 is enriched in diseased, < 1 is healthy
+
+
+```
+``` {r}
+# crawdad (last one!)
+coords_h <- GetTissueCoordinates(seuratHealthy)
+coords_d <- GetTissueCoordinates(seuratDiseased)
+
+pos_h <- data.frame(
+  x = coords_h$x,
+  y = coords_h$y
+)
+
+pos_d <- data.frame(
+  x = coords_d$x,
+  y = coords_d$y
+)
+
+celltypes_h <- seuratHealthy$celltype
+celltypes_d <- seuratDiseased$celltype
+
+sf_h <- toSF(
+  pos = pos_h,
+  cellTypes = celltypes_h
+)
+
+sf_d <- toSF(
+  pos = pos_d,
+  cellTypes = celltypes_d
+)
+
+# test visualization
+all_celltypes <- unique(c(celltypes_h, celltypes_d))
+colors <- rainbow(length(all_celltypes))
+names(colors) <- all_celltypes
+
+p1 <- data.frame(pos_h, celltype = celltypes_h) %>%
+  ggplot(aes(x, y, color = celltype)) +
+  geom_point(size = .01) +
+  scale_color_manual(values = colors) +
+  guides(colour = guide_legend(override.aes = list(size = 1))) +
+  labs(title = "Healthy") +
+  theme_minimal()
+
+p2 <- data.frame(pos_d, celltype = celltypes_d) %>%
+  ggplot(aes(x, y, color = celltype)) +
+  geom_point(size = .01) +
+  scale_color_manual(values = colors) +
+  guides(colour = guide_legend(override.aes = list(size = 1))) +
+  labs(title = "Diseased") +
+  theme_minimal()
+
+grid.arrange(p1, p2, nrow = 1)
+
+scales <- c(100, 300, 500, 700, 900)
+shuffle_h <- crawdad:::makeShuffledCells(
+  sf_h,
+  scales = scales,
+  perms = 3,
+  ncores = 1,
+  seed = 1,
+  verbose = TRUE
+)
+
+shuffle_d <- crawdad:::makeShuffledCells(
+  sf_d,
+  scales = scales,
+  perms = 3,
+  ncores = 1,
+  seed = 1,
+  verbose = TRUE
+)
+results_h <- findTrends(
+  sf_h,
+  neighDist = 50,
+  shuffleList = shuffle_h,
+  ncores = 8,
+  verbose = TRUE,
+  returnMeans = FALSE
+)
+
+results_d <- findTrends(
+  sf_d,
+  neighDist = 50,
+  shuffleList = shuffle_d,
+  ncores = 8,
+  verbose = TRUE,
+  returnMeans = FALSE
+)
+dat_h <- meltResultsList(results_h, withPerms = TRUE)
+dat_d <- meltResultsList(results_d, withPerms = TRUE)
+zsig_h <- correctZBonferroni(dat_h)
+zsig_d <- correctZBonferroni(dat_d)
+vizColocDotplot(dat_h, zSigThresh = zsig_h, zScoreLimit = 2*zsig_h,
+                dotSizes = c(3,15)) +
+  theme(axis.text.x = element_text(angle = 35, h = 0))
+
+vizColocDotplot(dat_d, zSigThresh = zsig_d, zScoreLimit = 2*zsig_d,
+                dotSizes = c(3,15)) +
+  theme(axis.text.x = element_text(angle = 35, h = 0))
+dat_h$id <- "Healthy"
+dat_d$id <- "Diseased"
+
+auc_samples <- calculateAUC(list(dat_h, dat_d))
+
+vizVarianceSamples(auc_samples)
+reference_var <- "PT-S3 metabolic"   # example
+neighbor_var  <- "PEC-injury"        # example
+
+
+
+
+```
